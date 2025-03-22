@@ -12,21 +12,33 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QInputDialog>
+#include <windows.h>
+#include <QMessageBox>
+#include <tlhelp32.h>
 
-MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
+MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), currentRow(-1), currentColumn(-1) {
     qDebug() << "Current working directory:" << QDir::currentPath();
 
     stackedWidget = new QStackedWidget(this);
     setCentralWidget(stackedWidget);
 
+    // Настраиваем экраны
     setupLoginScreen();
     setupDataScreen();
     setupErrorScreen();
+    setupSecondPasswordScreen();
 
-    stackedWidget->addWidget(loginScreen);
+    // Добавляем экраны в правильном порядке
+    stackedWidget->addWidget(loginScreen);  // Первый экран
     stackedWidget->addWidget(dataScreen);
     stackedWidget->addWidget(errorScreen);
+    stackedWidget->addWidget(secondPasswordScreen);  // Последний экран
 
+    // Устанавливаем loginScreen как активный экран
+    stackedWidget->setCurrentWidget(loginScreen);
+
+    // Подключаем сигнал cellDoubleClicked к слоту handleCellDoubleClick
     connect(dataTable, &QTableWidget::cellDoubleClicked,
             this, &MainWindow::handleCellDoubleClick);
 }
@@ -34,10 +46,33 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 MainWindow::~MainWindow() {
     // Очищаем чувствительные данные
     for (auto& cred : memoryStorage) {
-        cred.login.fill('*');
-        cred.password.fill('*');
+        cred.encryptedLogin.fill('*');
+        cred.encryptedPassword.fill('*');
     }
     memoryStorage.clear();
+}
+
+QByteArray MainWindow::generateSecondaryKey(const QString &password, const QString &salt) {
+    QByteArray combined = password.toUtf8() + salt.toUtf8();
+    return QCryptographicHash::hash(combined, QCryptographicHash::Sha3_256);
+}
+
+QByteArray MainWindow::encryptData(const QByteArray &data, const QByteArray &key) {
+    QByteArray encryptedData;
+    if (!do_crypt(data, encryptedData, key, true)) {
+        qDebug() << "Secondary encryption failed!";
+        return QByteArray();
+    }
+    return encryptedData;
+}
+
+QByteArray MainWindow::decryptData(const QByteArray &data, const QByteArray &key) {
+    QByteArray decryptedData;
+    if (!do_crypt(data, decryptedData, key, false)) {
+        qDebug() << "Secondary decryption failed!";
+        return QByteArray();
+    }
+    return decryptedData;
 }
 
 void MainWindow::setupLoginScreen() {
@@ -124,7 +159,14 @@ void MainWindow::setupErrorScreen() {
 }
 
 
+
 void MainWindow::checkPassword() {
+    if (IsDebuggerPresent()) {
+        QMessageBox::critical(this, "Debugger Detected", "A debugger has been detected. The application will now exit.");
+        QApplication::quit();  // Завершение программы
+        return;
+    }
+    // Остальной код метода checkPassword()
     QString pin = passwordField->text();
     passwordField->clear();
 
@@ -133,8 +175,11 @@ void MainWindow::checkPassword() {
         errorLabel->show();
         return;
     } else {
-        errorLabel->hide(); // Скрываем сообщение об ошибке, если поле PIN не пустое
+        errorLabel->hide();
     }
+
+    // Сохраняем мастер-пароль
+    masterPassword = pin;
 
     // Генерация ключа
     QByteArray key = QCryptographicHash::hash(
@@ -164,6 +209,7 @@ void MainWindow::checkPassword() {
     key.fill(0);
 }
 
+
 void MainWindow::createEncryptedFile(const QByteArray &key) {
     QFile jsonFile("credentials.json"); // Используем credentials.json
     if (!jsonFile.open(QIODevice::ReadOnly)) {
@@ -176,7 +222,7 @@ void MainWindow::createEncryptedFile(const QByteArray &key) {
     QByteArray jsonData = jsonFile.readAll(); // Считываем JSON данные
     jsonFile.close();
 
-    // Шифруем в hex виде
+    // Шифруем данные
     QByteArray encryptedData;
     if (!do_crypt(jsonData, encryptedData, key, true)) {
         qDebug() << "Encryption failed!";
@@ -184,6 +230,8 @@ void MainWindow::createEncryptedFile(const QByteArray &key) {
         stackedWidget->setCurrentWidget(errorScreen);
         return;
     }
+
+    qDebug() << "Encrypted data:" << encryptedData.toHex();
 
     // Преобразуем зашифрованные данные в hex-строку
     QByteArray hexEncryptedData = encryptedData.toHex();
@@ -249,15 +297,15 @@ bool MainWindow::decryptFile(const QByteArray &key) {
                 if (loginpassword.contains("login") && loginpassword.contains("password")) {
                     QString login = loginpassword["login"].toString();
                     QString password = loginpassword["password"].toString();
-                    memoryStorage.append({hostname, login, password});
-                } else {
-                    qDebug() << "Missing login or password in loginpassword";
+
+                    // Шифруем логин и пароль с использованием второго слоя
+                    QByteArray secondaryKey = generateSecondaryKey(masterPassword, hostname);
+                    QByteArray encryptedLogin = encryptData(login.toUtf8(), secondaryKey);
+                    QByteArray encryptedPassword = encryptData(password.toUtf8(), secondaryKey);
+
+                    memoryStorage.append({hostname, encryptedLogin, encryptedPassword});
                 }
-            } else {
-                qDebug() << "Missing hostname or loginpassword";
             }
-        } else {
-            qDebug() << "Value is not an object";
         }
     }
 
@@ -276,25 +324,32 @@ bool MainWindow::do_crypt(const QByteArray &in, QByteArray &out, const QByteArra
 
     unsigned char iv[EVP_MAX_IV_LENGTH];
     if (encrypt) {
+        // Генерация случайного IV при шифровании
         if (RAND_bytes(iv, EVP_MAX_IV_LENGTH) != 1) {
             qDebug() << "IV generation failed";
             EVP_CIPHER_CTX_free(ctx);
             return false;
         }
-        if (!EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL,
-                                reinterpret_cast<const unsigned char*>(key.data()), iv)) {
-            qDebug() << "EncryptInit failed";
-            EVP_CIPHER_CTX_free(ctx);
-            return false;
-        }
     } else {
+        // При дешифровании IV берется из начала зашифрованных данных
         if (in.size() < EVP_MAX_IV_LENGTH) {
             qDebug() << "Invalid encrypted data size. Data size:" << in.size() << ", IV size required:" << EVP_MAX_IV_LENGTH;
             EVP_CIPHER_CTX_free(ctx);
             return false;
         }
         memcpy(iv, in.constData(), EVP_MAX_IV_LENGTH);
-        if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL,
+    }
+
+    // Инициализация контекста
+    if (encrypt) {
+        if (!EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr,
+                                reinterpret_cast<const unsigned char*>(key.data()), iv)) {
+            qDebug() << "EncryptInit failed";
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+    } else {
+        if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr,
                                 reinterpret_cast<const unsigned char*>(key.data()), iv)) {
             qDebug() << "DecryptInit failed";
             EVP_CIPHER_CTX_free(ctx);
@@ -381,6 +436,93 @@ void MainWindow::loadDataToTable() {
     }
 }
 
+void MainWindow::setupSecondPasswordScreen() {
+    secondPasswordScreen = new QWidget(this);
+    QVBoxLayout *layout = new QVBoxLayout(secondPasswordScreen);
+
+    QLabel *titleLabel = new QLabel("Enter Second Password", this);
+    titleLabel->setAlignment(Qt::AlignCenter);
+    titleLabel->setStyleSheet("font-size: 16px;");
+
+    secondPasswordErrorLabel = new QLabel(this);
+    secondPasswordErrorLabel->setStyleSheet("color: red;");
+    secondPasswordErrorLabel->setAlignment(Qt::AlignCenter);
+    secondPasswordErrorLabel->hide();
+
+    secondPasswordField = new QLineEdit(this);
+    secondPasswordField->setPlaceholderText("Enter second password");
+    secondPasswordField->setEchoMode(QLineEdit::Password);
+
+    QPushButton *submitButton = new QPushButton("Submit", this);
+    connect(submitButton, &QPushButton::clicked, this, &MainWindow::handleSecondPasswordSubmit);
+
+    layout->addStretch(1);
+    layout->addWidget(titleLabel);
+    layout->addWidget(secondPasswordErrorLabel);
+    layout->addWidget(secondPasswordField);
+    layout->addWidget(submitButton);
+    layout->addStretch(1);
+
+    secondPasswordScreen->setLayout(layout);
+
+    // Добавляем экран в stackedWidget
+    stackedWidget->addWidget(secondPasswordScreen);
+}
+
+void MainWindow::handleSecondPasswordSubmit() {
+    QString secondPassword = secondPasswordField->text();
+    secondPasswordField->clear();
+
+    if (secondPassword.isEmpty()) {
+        secondPasswordErrorLabel->setText("Password cannot be empty!");
+        secondPasswordErrorLabel->show();
+        return;
+    }
+
+    // Проверяем, совпадает ли второй пароль с мастер-паролем
+    if (secondPassword != masterPassword) {
+        secondPasswordErrorLabel->setText("Incorrect second password!");
+        secondPasswordErrorLabel->show();
+        return;
+    }
+
+    // Получаем текущую строку и столбец
+    int row = currentRow;
+    int column = currentColumn;
+
+    // Генерация ключа для второго слоя шифрования
+    QByteArray secondaryKey = generateSecondaryKey(masterPassword, memoryStorage[row].hostname);
+    qDebug() << "Secondary key:" << secondaryKey.toHex();
+
+    QString textToCopy;
+    QString message;
+
+    if (column == 1) {  // Копируем логин
+        qDebug() << "Encrypted login data:" << memoryStorage[row].encryptedLogin.toHex();
+        QByteArray decryptedLogin = decryptData(memoryStorage[row].encryptedLogin, secondaryKey);
+        textToCopy = QString::fromUtf8(decryptedLogin);
+        message = "Login copied to clipboard!";
+    } else if (column == 2) {  // Копируем пароль
+        qDebug() << "Encrypted password data:" << memoryStorage[row].encryptedPassword.toHex();
+        QByteArray decryptedPassword = decryptData(memoryStorage[row].encryptedPassword, secondaryKey);
+        textToCopy = QString::fromUtf8(decryptedPassword);
+        message = "Password copied to clipboard!";
+    } else {
+        return;  // Не копируем, если кликнули не на логин или пароль
+    }
+
+    // Отладочный вывод
+    qDebug() << "Decrypted data:" << textToCopy;
+
+    // Копируем в буфер обмена
+    QClipboard *clipboard = QApplication::clipboard();
+    clipboard->setText(textToCopy);
+
+    // Уведомляем пользователя
+    errorLabelErrorScreen->setText(message);
+    stackedWidget->setCurrentWidget(errorScreen);
+}
+
 void MainWindow::handleCellDoubleClick(int row, int column) {
     if (row < 0 || row >= memoryStorage.size()) {
         errorLabelErrorScreen->setText("Invalid cell selected!");
@@ -388,27 +530,12 @@ void MainWindow::handleCellDoubleClick(int row, int column) {
         return;
     }
 
-    const CredentialEntry& entry = memoryStorage[row];
-    QString textToCopy;
-    QString message;
+    // Сохраняем текущую строку и столбец
+    currentRow = row;
+    currentColumn = column;
 
-    if (column == 1) { // Копируем логин
-        textToCopy = entry.login;
-        message = "Login copied to clipboard!"; // Сообщение для логина
-    } else if (column == 2) { // Копируем пароль
-        textToCopy = entry.password;
-        message = "Password copied to clipboard!"; // Сообщение для пароля
-    } else {
-        return; // Не копируем, если кликнули не на логин или пароль
-    }
-
-    // Копируем в буфер обмена
-    QClipboard *clipboard = QApplication::clipboard();
-    clipboard->setText(textToCopy);
-
-    // Уведомляем пользователя
-    errorLabelErrorScreen->setText(message); // Используем подготовленное сообщение
-    stackedWidget->setCurrentWidget(errorScreen);
+    // Переключаемся на экран ввода второго пароля
+    stackedWidget->setCurrentWidget(secondPasswordScreen);
 }
 
 void MainWindow::returnToLogin() {

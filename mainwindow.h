@@ -13,10 +13,9 @@
 
 struct CredentialEntry {
     QString hostname;
-    QString login;
-    QString password;
+    QByteArray encryptedLogin;
+    QByteArray encryptedPassword;
 };
-
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -35,22 +34,35 @@ private:
     QVector<CredentialEntry> memoryStorage;
     QSortFilterProxyModel *proxyModel;
     QLabel *errorLabelErrorScreen;
+    QString masterPassword;
 
 
     void setupLoginScreen();
     void setupDataScreen();
     void setupErrorScreen();
+    void setupSecondPasswordScreen();  // Метод для настройки нового экрана
+    void handleSecondPasswordSubmit();  // Метод для обработки ввода второго пароля
 
     bool do_crypt(const QByteArray &in, QByteArray &out, const QByteArray &key, bool encrypt);
     bool decryptFile(const QByteArray &key);
     void loadDataToTable();
     void secureClear(QByteArray &data);
     void createEncryptedFile(const QByteArray &key);
+    QWidget *secondPasswordScreen;  // Новый экран для ввода второго пароля
+    QLineEdit *secondPasswordField;  // Поле для ввода второго пароля
+    QLabel *secondPasswordErrorLabel;  // Метка для ошибок
+    int currentRow;  // Текущая строка
+    int currentColumn;
+
+    // Новые методы для второго слоя шифрования
+    QByteArray generateSecondaryKey(const QString &masterKey, const QString &uniqueIdentifier);
+    QByteArray encryptData(const QByteArray &data, const QByteArray &key);
+    QByteArray decryptData(const QByteArray &data, const QByteArray &key);
 
 private slots:
+    void handleCellDoubleClick(int row, int column);  // Слот для обработки двойного клика
     void checkPassword();
     void returnToLogin();
-    void handleCellDoubleClick(int row, int column);
     void filterTable(const QString &text);
 };
 
