@@ -1,0 +1,2 @@
+^F:\APPLICATION\LAB_3\ENCLAVE\ENCLAVE\ENCLAVE.EDL
+"F:\Application\Lab_3\Enclave\packages\Intel.SGX.SDK.2.25.100.3\build\native\bin\win32\release\sgx_edger8r.exe" --trusted "F:\Application\Lab_3\Enclave\Enclave\Enclave.edl" --search-path "F:\Application\Lab_3\Enclave\packages\Intel.SGX.SDK.2.25.100.3\build\native\include"
